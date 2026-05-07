@@ -1,773 +1,1492 @@
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║           RED LOTUS KILL TRACKER - Discord Bot v1.0             ║
-// ║       AI-powered kill reader from screenshots + merge           ║
-// ╚══════════════════════════════════════════════════════════════════╝
+import os
+import re
+import json
+import discord
+import cv2
+import numpy as np
+import pytesseract
 
-require("dotenv").config();
-const {
-  Client,
-  GatewayIntentBits,
-  EmbedBuilder,
-  AttachmentBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  ActionRowBuilder,
-  PermissionFlagsBits,
-} = require("discord.js");
-const Anthropic = require("@anthropic-ai/sdk");
-const fs = require("fs");
-const path = require("path");
-const https = require("https");
+from datetime import datetime
+from difflib import get_close_matches, SequenceMatcher
+from discord.ext import commands, tasks
+from typing import Dict, List, Tuple, Optional
 
-// ─── CONFIG ──────────────────────────────────────────────────────────────────
+# =========================================================
+# ENV / CONFIG
+# =========================================================
 
-const CONFIG = {
-  FAMILY_NAME: "Red Lotus",
-  DATA_FILE: path.join(__dirname, "kills_data.json"),
-  SESSION_FILE: path.join(__dirname, "sessions.json"),
-  MAX_IMAGE_SIZE_MB: 20,
-  ALLOWED_ROLES: [], // Prazno = svi mogu koristiti. Dodaj role ID-eve za restrikciju
-  ADMIN_ROLE_ID: process.env.ADMIN_ROLE_ID || "",
-};
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-// ─── INICIJALIZACIJA ─────────────────────────────────────────────────────────
+WATCH_CHANNEL_ID = int(os.getenv("WATCH_CHANNEL_ID", "0"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-  ],
-});
+# Za Red Lotus stavi u Railway Variables:
+# FAMILY_NAME=Red Lotus
+FAMILY_NAME = os.getenv("FAMILY_NAME", "Red Lotus").strip()
+KILL_VALUE = int(os.getenv("KILL_VALUE", "15000"))
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+BOT_NAME = os.getenv("BOT_NAME", "Bonus Bot by DD").strip()
+THUMBNAIL_URL = os.getenv("THUMBNAIL_URL", "").strip()
+BANNER_URL = os.getenv("BANNER_URL", "").strip()
 
-// ─── DATA MANAGEMENT ─────────────────────────────────────────────────────────
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-function loadData() {
-  if (!fs.existsSync(CONFIG.DATA_FILE)) {
-    return { kills: {}, totalKills: 0, lastUpdated: null };
-  }
-  return JSON.parse(fs.readFileSync(CONFIG.DATA_FILE, "utf8"));
+WEEKLY_DATA_FILE = os.path.join(DATA_DIR, "kill_lista.json")
+MONTHLY_DATA_FILE = os.path.join(DATA_DIR, "mjesecna_kill_lista.json")
+MONTHLY_RESET_META_FILE = os.path.join(DATA_DIR, "monthly_reset_meta.json")
+LEARNED_NAMES_FILE = os.path.join(DATA_DIR, "learned_names.json")
+KNOWN_PLAYERS_FILE = os.path.join(DATA_DIR, "known_players.json")
+
+AUTO_LEARN_CUTOFF = 0.88
+KNOWN_PLAYER_CUTOFF = 0.76
+FORCE_KNOWN_AS_FAMILY = True
+STRICT_KNOWN_ONLY = True  # V5 PRO: bot ne dodaje nista sto nije known/alias/learned  # V3: ako OCR ne procita Red Lotus, ali prepozna known playera, prihvati ga
+
+# =========================================================
+# KNOWN PLAYERS - BOT DODAJE SAMO OVA IMENA / ALIAS / LEARNED
+# =========================================================
+
+DEFAULT_KNOWN_PLAYERS = [
+    "Mateja Matic",
+    "Deda White",
+    "Buki Honanza",
+    "Kerzy Fuentes",
+    "Adis Bossancher000",
+    "Zed Elusive",
+    "Edjrodj Sawaihsa",
+    "Prento Primechief",
+    "Albert Wesker",
+    "Kimi Rixon",
+    "Makii Primechief",
+    "Tyson Elysium",
+    "Any Elysium",
+    "Jonah Tracer",
+    "Riven Tracer",
+    "Jmmor Elysium",
+
+    # dodatni od ranije / rezerva
+    "Skadin Zmaj",
+    "Vladyy Kideksicc",
+    "Ken Fring",
+    "Makii Fraud",
+    "Jozo Lahentaestamulocaa",
+    "Mire Hayabusa",
+    "Kerson Wayne",
+]
+
+# =========================================================
+# ALIASES / OCR ISPRAVKE
+# lijevo = pogresno OCR procitano
+# desno = tacno ime
+# =========================================================
+
+ALIASES = {
+    # FAMILY OCR
+    "redlotus": "red lotus",
+    "red iotus": "red lotus",
+    "red lotu5": "red lotus",
+    "red lotos": "red lotus",
+
+    # MATEJA
+    "mateja matic eg": "mateja matic",
+    "matoja matic eg": "mateja matic",
+    "matoja matic": "mateja matic",
+    "mateja matlc": "mateja matic",
+    "mateja matic": "mateja matic",
+
+    # DEDA WHITE
+    "deda vhite": "deda white",
+    "deda uhite": "deda white",
+    "deqa white": "deda white",
+    "deda whlte": "deda white",
+    "deda white": "deda white",
+
+    # BUKI
+    "buki honanzaa": "buki honanza",
+    "buki honan2a": "buki honanza",
+    "buki honan7a": "buki honanza",
+    "buki honanza": "buki honanza",
+
+    # KERZY
+    "kerzy fuentos": "kerzy fuentes",
+    "kerzy fuenles": "kerzy fuentes",
+    "kerzy fuentes": "kerzy fuentes",
+
+    # ADIS
+    "adis bossancheroo": "adis bossancher000",
+    "adis bossancherooo": "adis bossancher000",
+    "adis bossancher0oo": "adis bossancher000",
+    "adis bossancher000": "adis bossancher000",
+
+    # ZED
+    "zed eluslve": "zed elusive",
+    "zed eluslue": "zed elusive",
+    "zed elusive": "zed elusive",
+
+    # EDJRODJ
+    "edjrodjsawaihsa": "edjrodj sawaihsa",
+    "edjrodj sawaihsa": "edjrodj sawaihsa",
+    "edjrodj sawaiha": "edjrodj sawaihsa",
+    "edjrodj sawaihsa": "edjrodj sawaihsa",
+
+    # PRENTO
+    "prento primechlef": "prento primechief",
+    "prento primechiet": "prento primechief",
+    "prento primechief": "prento primechief",
+
+    # ALBERT
+    "albert vesker": "albert wesker",
+    "albert wesk3r": "albert wesker",
+    "albert wesker": "albert wesker",
+
+    # KIMI
+    "kimi rlxon": "kimi rixon",
+    "kimi rix0n": "kimi rixon",
+    "kimi rixon": "kimi rixon",
+
+    # MAKII PRIMECHIEF
+    "makii primechlef": "makii primechief",
+    "makii primechiet": "makii primechief",
+    "makii primechief": "makii primechief",
+
+    # TYSON
+    "tyson elyslum": "tyson elysium",
+    "tyson elysiun": "tyson elysium",
+    "tyson elysium": "tyson elysium",
+
+    # ANY
+    "any elyslum": "any elysium",
+    "any elysiun": "any elysium",
+    "any elysium": "any elysium",
+
+    # JONAH/RIVEN/JMMOR
+    "jonah trager": "jonah tracer",
+    "jonah tracer": "jonah tracer",
+    "riven trager": "riven tracer",
+    "riven tracer": "riven tracer",
+    "jmmor elyslum": "jmmor elysium",
+    "jmmor elysiun": "jmmor elysium",
+    "jmmor elysium": "jmmor elysium",
+
+    # OLD/RESERVE
+    "skadin zmai": "skadin zmaj",
+    "skadin znaj": "skadin zmaj",
+    "vladyy kideksic": "vladyy kideksicc",
+    "vladyy kidekslcc": "vladyy kideksicc",
+    "vlady kideksicc": "vladyy kideksicc",
+    "ken frlng": "ken fring",
+    "ken fnng": "ken fring",
+    "maki fraud": "makii fraud",
+    "makii traud": "makii fraud",
+    "jozo lahenta": "jozo lahentaestamulocaa",
+    "jozo lahentaestamu": "jozo lahentaestamulocaa",
+    "jozo lahentaestamuloca": "jozo lahentaestamulocaa",
+    "mire hayabusa": "mire hayabusa",
+    "kerson wayne": "kerson wayne",
 }
 
-function saveData(data) {
-  data.lastUpdated = new Date().toISOString();
-  fs.writeFileSync(CONFIG.DATA_FILE, JSON.stringify(data, null, 2));
+IGNORED_NAME_PREFIXES = [
+    "gg",
+    "ic",
+    "i c",
+    "s ae",
+    "sae",
+    "s a e",
+    "sc",
+    "sg",
+    "cl",
+]
+
+OCR_GARBAGE_WORDS = {
+    "white", "sharks", "red", "lotus", "top", "ubica", "rat", "za", "resurs",
+    "pobednicka", "familija", "kill", "kills"
 }
 
-function loadSessions() {
-  if (!fs.existsSync(CONFIG.SESSION_FILE)) {
-    return {};
-  }
-  return JSON.parse(fs.readFileSync(CONFIG.SESSION_FILE, "utf8"));
-}
+missing_vars = []
+if not DISCORD_TOKEN:
+    missing_vars.append("DISCORD_TOKEN")
+if GUILD_ID == 0:
+    missing_vars.append("GUILD_ID")
+if WATCH_CHANNEL_ID == 0:
+    missing_vars.append("WATCH_CHANNEL_ID")
+if LOG_CHANNEL_ID == 0:
+    missing_vars.append("LOG_CHANNEL_ID")
 
-function saveSessions(sessions) {
-  fs.writeFileSync(CONFIG.SESSION_FILE, JSON.stringify(sessions, null, 2));
-}
+# =========================================================
+# DISCORD SETUP
+# =========================================================
 
-// ─── AI IMAGE ANALYSIS ────────────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.message_content = True
+intents.messages = True
+intents.guilds = True
 
-async function analyzeKillScreenshot(imageUrl) {
-  // Preuzmi sliku kao base64
-  const imageBuffer = await downloadImage(imageUrl);
-  const base64Image = imageBuffer.toString("base64");
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-  const prompt = `Analizuj ovu sliku iz igre i izvuci SAMO podatke o kill feed-u / kill listi.
+# =========================================================
+# EMBED STIL
+# =========================================================
 
-ZADATAK:
-1. Pronađi sve ubojice (killere) koji pripadaju familiji/klanu "${CONFIG.FAMILY_NAME}"
-2. Za svakog igrača iz "${CONFIG.FAMILY_NAME}" koji je napravio kill, izvuci:
-   - Tačno ime igrača (case-sensitive)
-   - Broj killova koji su vidljivi na slici
+COLOR_INFO = 0x3498DB
+COLOR_SUCCESS = 0x2ECC71
+COLOR_WARNING = 0xF1C40F
+COLOR_DANGER = 0xE74C3C
 
-PRAVILA:
-- Uključi SAMO igrače čije ime sadrži "${CONFIG.FAMILY_NAME}" ili koji su jasno označeni kao član te familije
-- Ako je kill feed lista (više redova), broji svaki red kao jedan kill po ubojici
-- Ignoriši žrtve (victims), samo nas zanimaju killeri
-- Ako ne možeš jasno pročitati ime, preskoči ga
+BOT_FOOTER = f"{BOT_NAME} • {FAMILY_NAME} Tracker"
 
-ODGOVORI ISKLJUČIVO u JSON formatu bez ikakvog teksta pre ili posle:
-{
-  "family": "${CONFIG.FAMILY_NAME}",
-  "players": [
-    {"name": "ImePIgraca", "kills": 5},
-    {"name": "DrugIgrac", "kills": 3}
-  ],
-  "total_kills_found": 8,
-  "confidence": "high/medium/low",
-  "notes": "opciona napomena o kvalitetu slike ili problemima"
-}
+# =========================================================
+# POMOCNE FUNKCIJE
+# =========================================================
 
-Ako ne postoje killovi od familije "${CONFIG.FAMILY_NAME}" na slici, vrati:
-{"family": "${CONFIG.FAMILY_NAME}", "players": [], "total_kills_found": 0, "confidence": "high", "notes": "Nema killova od ove familije"}`;
+def normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
-  const response = await anthropic.messages.create({
-    model: "claude-opus-4-5",
-    max_tokens: 1500,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: getMediaType(imageUrl),
-              data: base64Image,
-            },
-          },
-          {
-            type: "text",
-            text: prompt,
-          },
-        ],
-      },
-    ],
-  });
+def normalize_name_basic(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9 ]", " ", text)
+    return normalize_spaces(text)
 
-  const rawText = response.content[0].text.trim();
+def family_name_normalized() -> str:
+    return normalize_name_basic(FAMILY_NAME)
 
-  // Čišćenje odgovora
-  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    throw new Error("AI nije vratio validan JSON odgovor");
-  }
+def format_player_name(name: str) -> str:
+    return " ".join(part.capitalize() for part in name.split())
 
-  return JSON.parse(jsonMatch[0]);
-}
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, normalize_name_basic(a), normalize_name_basic(b)).ratio()
 
-// ─── HELPER FUNCTIONS ────────────────────────────────────────────────────────
+def clean_player_prefixes(name: str) -> str:
+    n = normalize_spaces(name)
+    n_low = normalize_name_basic(n)
 
-function downloadImage(url) {
-  return new Promise((resolve, reject) => {
-    https
-      .get(url, (res) => {
-        const chunks = [];
-        res.on("data", (chunk) => chunks.push(chunk));
-        res.on("end", () => resolve(Buffer.concat(chunks)));
-        res.on("error", reject);
-      })
-      .on("error", reject);
-  });
-}
+    changed = True
+    while changed:
+        changed = False
+        for prefix in IGNORED_NAME_PREFIXES:
+            pref = normalize_name_basic(prefix)
+            if n_low.startswith(pref + " "):
+                original_parts = n.split()
+                prefix_parts = prefix.split()
+                n = " ".join(original_parts[len(prefix_parts):]).strip()
+                n_low = normalize_name_basic(n)
+                changed = True
+                break
 
-function getMediaType(url) {
-  const lower = url.toLowerCase();
-  if (lower.includes(".png")) return "image/png";
-  if (lower.includes(".gif")) return "image/gif";
-  if (lower.includes(".webp")) return "image/webp";
-  return "image/jpeg";
-}
+    return normalize_spaces(n)
 
-function formatNumber(n) {
-  return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-}
+def is_name_garbage(name: str) -> bool:
+    n = normalize_name_basic(name)
+    if not n:
+        return True
+    parts = n.split()
+    if len(parts) == 0:
+        return True
+    if len(parts) == 1 and parts[0] in OCR_GARBAGE_WORDS:
+        return True
+    if all(p in OCR_GARBAGE_WORDS for p in parts):
+        return True
+    return False
 
-function getMedalEmoji(rank) {
-  if (rank === 1) return "🥇";
-  if (rank === 2) return "🥈";
-  if (rank === 3) return "🥉";
-  if (rank <= 5) return "🔴";
-  return "⚔️";
-}
+def load_json_file(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-function getRankTitle(kills) {
-  if (kills >= 500) return "💀 LEGENDARY SLAYER";
-  if (kills >= 200) return "🔥 MASTER KILLER";
-  if (kills >= 100) return "⚔️ ELITE WARRIOR";
-  if (kills >= 50) return "🗡️ VETERAN";
-  if (kills >= 20) return "🏹 FIGHTER";
-  return "🌱 RECRUIT";
-}
+def save_json_file(path: str, data) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-// ─── MERGE KILLS LOGIC ───────────────────────────────────────────────────────
+def load_data(file_path: str) -> Dict[str, int]:
+    raw = load_json_file(file_path, {})
+    return {str(k): int(v) for k, v in raw.items()}
 
-function mergeKillData(existingData, newPlayers) {
-  const merged = { ...existingData };
+def save_data(file_path: str, data: Dict[str, int]) -> None:
+    save_json_file(file_path, data)
 
-  for (const player of newPlayers) {
-    const name = player.name.trim();
-    if (!name) continue;
+def reset_data(file_path: str) -> None:
+    save_data(file_path, {})
 
-    if (merged[name]) {
-      merged[name].kills += player.kills;
-      merged[name].screenshots += 1;
-      merged[name].lastSeen = new Date().toISOString();
-    } else {
-      merged[name] = {
-        kills: player.kills,
-        screenshots: 1,
-        firstSeen: new Date().toISOString(),
-        lastSeen: new Date().toISOString(),
-      };
+def load_learned_names() -> Dict[str, str]:
+    data = load_json_file(LEARNED_NAMES_FILE, {})
+    cleaned = {}
+    for k, v in data.items():
+        cleaned[normalize_name_basic(str(k))] = normalize_name_basic(str(v))
+    return cleaned
+
+def save_learned_names(data: Dict[str, str]) -> None:
+    save_json_file(LEARNED_NAMES_FILE, data)
+
+def learn_name(observed_name: str, canonical_name: str) -> None:
+    learned = load_learned_names()
+    observed_name = normalize_name_basic(observed_name)
+    canonical_name = normalize_name_basic(canonical_name)
+    if observed_name and canonical_name:
+        learned[observed_name] = canonical_name
+        save_learned_names(learned)
+
+def load_known_players() -> List[str]:
+    """
+    Uvijek spoji DEFAULT_KNOWN_PLAYERS + known_players.json.
+    Ovo je bitno jer Railway volume vec ima stari known_players.json,
+    pa se novi igraci iz koda inace ne bi automatski dodali.
+    """
+    data = load_json_file(KNOWN_PLAYERS_FILE, [])
+    if not isinstance(data, list):
+        data = []
+
+    merged = []
+    seen = set()
+
+    for name in DEFAULT_KNOWN_PLAYERS + [str(x).strip() for x in data if str(x).strip()]:
+        key = normalize_name_basic(name)
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(format_player_name(key))
+
+    save_json_file(KNOWN_PLAYERS_FILE, merged)
+    return merged
+
+def save_known_players(players: List[str]) -> None:
+    unique = []
+    seen = set()
+    for p in players:
+        key = normalize_name_basic(p)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(format_player_name(key))
+    save_json_file(KNOWN_PLAYERS_FILE, unique)
+
+def get_all_known_canonical_names() -> List[str]:
+    names = set()
+
+    for _, value in ALIASES.items():
+        v = normalize_name_basic(value)
+        if v and v != family_name_normalized():
+            names.add(v)
+
+    learned = load_learned_names()
+    for _, value in learned.items():
+        v = normalize_name_basic(value)
+        if v:
+            names.add(v)
+
+    weekly = load_data(WEEKLY_DATA_FILE)
+    monthly = load_data(MONTHLY_DATA_FILE)
+
+    for name in weekly.keys():
+        names.add(normalize_name_basic(name))
+    for name in monthly.keys():
+        names.add(normalize_name_basic(name))
+
+    for name in load_known_players():
+        names.add(normalize_name_basic(name))
+
+    return sorted(names)
+
+def resolve_against_known_players(raw_name: str) -> Optional[str]:
+    raw = normalize_name_basic(raw_name)
+    if not raw:
+        return None
+
+    known_players = load_known_players()
+    if not known_players:
+        return None
+
+    normalized_map = {normalize_name_basic(name): name for name in known_players}
+    candidates = list(normalized_map.keys())
+
+    matches = get_close_matches(raw, candidates, n=1, cutoff=KNOWN_PLAYER_CUTOFF)
+    if matches:
+        return normalize_name_basic(normalized_map[matches[0]])
+
+    best_name = None
+    best_score = 0.0
+    for cand in candidates:
+        score = similarity(raw, cand)
+        if score > best_score:
+            best_score = score
+            best_name = cand
+
+    if best_name and best_score >= KNOWN_PLAYER_CUTOFF:
+        return normalize_name_basic(normalized_map[best_name])
+
+    return None
+
+def is_allowed_canonical_name(canonical_name: str) -> bool:
+    """
+    V5 PRO whitelist:
+    Ime mora biti u known_players ili learned vrijednostima.
+    Ovo sprjecava random OCR imena.
+    """
+    c = normalize_name_basic(canonical_name)
+    if not c:
+        return False
+
+    known_set = {normalize_name_basic(x) for x in load_known_players()}
+    learned_values = {normalize_name_basic(v) for v in load_learned_names().values()}
+    default_set = {normalize_name_basic(x) for x in DEFAULT_KNOWN_PLAYERS}
+
+    return c in known_set or c in learned_values or c in default_set
+
+def resolve_known_player_from_text_loose(text: str) -> Optional[str]:
+    """
+    V5 PRO fallback:
+    Kad OCR linija ima smece, probaj naci najblize known ime unutar cijelog teksta.
+    """
+    raw = normalize_name_basic(text)
+    if not raw:
+        return None
+
+    raw = re.sub(r"\b\d+\b", " ", raw)
+    for word in OCR_GARBAGE_WORDS:
+        raw = re.sub(rf"\b{re.escape(word)}\b", " ", raw)
+    raw = normalize_spaces(raw)
+
+    if not raw:
+        return None
+
+    best = None
+    best_score = 0.0
+    for known in load_known_players():
+        k = normalize_name_basic(known)
+        score = similarity(raw, k)
+
+        known_parts = set(k.split())
+        raw_parts = set(raw.split())
+        overlap = len(known_parts & raw_parts)
+        if overlap:
+            score += min(0.12, overlap * 0.06)
+
+        if score > best_score:
+            best_score = score
+            best = k
+
+    if best and best_score >= 0.72:
+        return best
+    return None
+
+def resolve_player_name(raw_name: str) -> Tuple[str, str]:
+    """
+    V5 PRO:
+    - nema novih random imena
+    - prioritet alias/known/learned
+    - fuzzy samo prema whitelist known igracima
+    """
+    raw_name = clean_player_prefixes(raw_name)
+    raw_name = normalize_name_basic(raw_name)
+
+    if not raw_name:
+        return "", "empty"
+
+    if raw_name in ALIASES:
+        alias_value = normalize_name_basic(ALIASES[raw_name])
+        if alias_value == family_name_normalized():
+            return "", "family_alias_rejected"
+        if is_allowed_canonical_name(alias_value):
+            return alias_value, "alias"
+        return "", "alias_not_known"
+
+    learned = load_learned_names()
+    if raw_name in learned:
+        learned_name = normalize_name_basic(learned[raw_name])
+        if is_allowed_canonical_name(learned_name):
+            return learned_name, "learned"
+
+    known_match = resolve_against_known_players(raw_name)
+    if known_match and is_allowed_canonical_name(known_match):
+        learn_name(raw_name, known_match)
+        return known_match, "known_players"
+
+    loose_match = resolve_known_player_from_text_loose(raw_name)
+    if loose_match and is_allowed_canonical_name(loose_match):
+        learn_name(raw_name, loose_match)
+        return loose_match, "known_loose"
+
+    known_names = sorted({normalize_name_basic(x) for x in load_known_players()})
+    matches = get_close_matches(raw_name, known_names, n=1, cutoff=AUTO_LEARN_CUTOFF)
+
+    if matches:
+        canonical = normalize_name_basic(matches[0])
+        learn_name(raw_name, canonical)
+        return canonical, "fuzzy_known"
+
+    return "", "rejected_unknown"
+
+def find_best_player_key(data: Dict[str, int], player_name: str) -> Optional[str]:
+    if not data:
+        return None
+
+    player_name_norm = normalize_name_basic(player_name)
+
+    for name in data.keys():
+        if normalize_name_basic(name) == player_name_norm:
+            return name
+
+    partial_matches = []
+    for name in data.keys():
+        norm_name = normalize_name_basic(name)
+        if player_name_norm in norm_name or norm_name in player_name_norm:
+            partial_matches.append(name)
+
+    if len(partial_matches) == 1:
+        return partial_matches[0]
+
+    normalized_to_original = {normalize_name_basic(name): name for name in data.keys()}
+    candidates = list(normalized_to_original.keys())
+    matches = get_close_matches(player_name_norm, candidates, n=1, cutoff=0.65)
+
+    if matches:
+        return normalized_to_original[matches[0]]
+
+    best_key = None
+    best_score = 0.0
+    for original in data.keys():
+        score = similarity(player_name, original)
+        if score > best_score:
+            best_score = score
+            best_key = original
+
+    if best_key and best_score >= 0.65:
+        return best_key
+
+    return None
+
+def is_reset_allowed(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    if member.guild_permissions.manage_guild:
+        return True
+
+    if ADMIN_ROLE_ID:
+        for role in member.roles:
+            if int(role.id) == int(ADMIN_ROLE_ID):
+                return True
+    return False
+
+def ensure_admin(ctx: commands.Context) -> bool:
+    return isinstance(ctx.author, discord.Member) and is_reset_allowed(ctx.author)
+
+def sort_scoreboard(data: Dict[str, int]) -> List[Tuple[str, int]]:
+    return sorted(data.items(), key=lambda x: (-x[1], x[0].lower()))
+
+def make_embed(title: str, description: str = "", color: int = COLOR_INFO) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text=BOT_FOOTER)
+    if THUMBNAIL_URL:
+        embed.set_thumbnail(url=THUMBNAIL_URL)
+    if BANNER_URL:
+        embed.set_image(url=BANNER_URL)
+    return embed
+
+def build_weekly_score_embed_with_bonus(data: Dict[str, int]) -> discord.Embed:
+    if not data:
+        return make_embed(
+            f"🏆 Sedmični {FAMILY_NAME} Ranking",
+            "```diff\n- Sedmična lista je trenutno prazna.\n```",
+            COLOR_WARNING
+        )
+
+    sorted_players = sort_scoreboard(data)
+    top_15 = sorted_players[:15]
+    lines = []
+    medal_map = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+    for rank, (name, kills) in enumerate(top_15, start=1):
+        bonus = kills * KILL_VALUE
+        icon = medal_map.get(rank, f"`#{rank}`")
+        lines.append(f"{icon} **{format_player_name(name)}** — `{kills}` killova • 💸 `{bonus:,}$`")
+
+    embed = make_embed(f"🏆 Sedmični {FAMILY_NAME} Ranking", "\n".join(lines), COLOR_WARNING)
+
+    embed.add_field(name="👥 Igrača", value=str(len(sorted_players)), inline=True)
+    embed.add_field(name="💀 Ukupno killova", value=str(sum(data.values())), inline=True)
+
+    if sorted_players:
+        leader_name, leader_kills = sorted_players[0]
+        leader_bonus = leader_kills * KILL_VALUE
+        embed.add_field(
+            name="👑 Lider",
+            value=f"**{format_player_name(leader_name)}**\n`{leader_kills}` killova • 💸 `{leader_bonus:,}$`",
+            inline=True
+        )
+
+    return embed
+
+def build_monthly_score_embed(data: Dict[str, int]) -> discord.Embed:
+    if not data:
+        return make_embed(
+            f"📆 Mjesečni {FAMILY_NAME} Ranking",
+            "```diff\n- Mjesečna lista je trenutno prazna.\n```",
+            COLOR_INFO
+        )
+
+    sorted_players = sort_scoreboard(data)
+    top_15 = sorted_players[:15]
+    lines = []
+    medal_map = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+    for rank, (name, kills) in enumerate(top_15, start=1):
+        icon = medal_map.get(rank, f"`#{rank}`")
+        lines.append(f"{icon} **{format_player_name(name)}** — `{kills}` killova")
+
+    embed = make_embed(f"📆 Mjesečni {FAMILY_NAME} Ranking", "\n".join(lines), COLOR_INFO)
+    embed.add_field(name="👥 Igrača", value=str(len(sorted_players)), inline=True)
+    embed.add_field(name="💀 Ukupno killova", value=str(sum(data.values())), inline=True)
+
+    if sorted_players:
+        leader_name, leader_kills = sorted_players[0]
+        embed.add_field(
+            name="👑 Lider",
+            value=f"**{format_player_name(leader_name)}**\n`{leader_kills}` killova",
+            inline=True
+        )
+
+    return embed
+
+def add_scores_to_file(file_path: str, found_scores: Dict[str, int]) -> Dict[str, int]:
+    total = load_data(file_path)
+    for name, kills in found_scores.items():
+        total[name] = total.get(name, 0) + kills
+    save_data(file_path, total)
+    return total
+
+def load_reset_meta() -> dict:
+    return load_json_file(MONTHLY_RESET_META_FILE, {})
+
+def save_reset_meta(data: dict) -> None:
+    save_json_file(MONTHLY_RESET_META_FILE, data)
+
+def check_and_reset_monthly_if_needed() -> bool:
+    now = datetime.now()
+    current_key = f"{now.year}-{now.month:02d}"
+
+    meta = load_reset_meta()
+    last_reset_key = meta.get("last_monthly_reset")
+
+    if now.day == 1 and now.hour >= 4 and last_reset_key != current_key:
+        reset_data(MONTHLY_DATA_FILE)
+        save_reset_meta({"last_monthly_reset": current_key})
+        return True
+    return False
+
+async def read_attachment_bytes(attachment: discord.Attachment) -> bytes:
+    data = await attachment.read()
+    if not data:
+        raise ValueError("Attachment je prazan.")
+    return data
+
+async def send_log_embed(title: str, description: str, color: int = COLOR_INFO):
+    if not LOG_CHANNEL_ID:
+        return
+
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+        except Exception:
+            return
+
+    try:
+        await channel.send(embed=make_embed(title, description, color))
+    except Exception:
+        pass
+
+# =========================================================
+# OCR V2.5
+# =========================================================
+
+def build_variants(img_gray: np.ndarray) -> List[np.ndarray]:
+    """
+    LIGHT-STABLE OCR:
+    Manje OCR prolaza = manje timeouta na Railway.
+    I dalje radi contrast + threshold, ali bez previse teskih varijanti.
+    """
+    variants = []
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    base = clahe.apply(img_gray)
+    base = cv2.convertScaleAbs(base, alpha=1.55, beta=8)
+    variants.append(base)
+
+    blur = cv2.GaussianBlur(base, (3, 3), 0)
+    _, th = cv2.threshold(blur, 145, 255, cv2.THRESH_BINARY)
+    variants.append(th)
+
+    return variants
+
+def preprocess_image_regions(image_bytes: bytes) -> Dict[str, List[np.ndarray]]:
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        raise ValueError("Slika nije mogla da se učita.")
+
+    img = cv2.resize(img, None, fx=2.4, fy=2.4, interpolation=cv2.INTER_CUBIC)
+    h, w = img.shape[:2]
+
+    board = img[int(h * 0.02):int(h * 0.95), int(w * 0.36):int(w * 0.995)]
+    names_region = board[:, int(board.shape[1] * 0.00):int(board.shape[1] * 0.56)]
+    kills_region = board[:, int(board.shape[1] * 0.48):int(board.shape[1] * 0.76)]
+    family_region = board[:, int(board.shape[1] * 0.72):int(board.shape[1] * 1.00)]
+
+    board_gray = cv2.cvtColor(board, cv2.COLOR_BGR2GRAY)
+    names_gray = cv2.cvtColor(names_region, cv2.COLOR_BGR2GRAY)
+    kills_gray = cv2.cvtColor(kills_region, cv2.COLOR_BGR2GRAY)
+    family_gray = cv2.cvtColor(family_region, cv2.COLOR_BGR2GRAY)
+
+    return {
+        "board": build_variants(board_gray),
+        "names": build_variants(names_gray),
+        "kills": build_variants(kills_gray),
+        "family": build_variants(family_gray),
     }
-  }
 
-  return merged;
-}
+def ocr_lines_tesseract(image: np.ndarray, configs: List[str]) -> List[Tuple[str, float]]:
+    all_lines: List[Tuple[str, float]] = []
 
-// ─── EMBED BUILDERS ──────────────────────────────────────────────────────────
+    for config in configs:
+        data = pytesseract.image_to_data(
+            image,
+            lang="eng",
+            config=config,
+            output_type=pytesseract.Output.DICT
+        )
 
-function buildSuccessEmbed(analysisResult, addedKills, sessionId) {
-  const embed = new EmbedBuilder()
-    .setColor(0xff2244)
-    .setTitle("🔴 RED LOTUS — Kill Screenshot Analyzed")
-    .setDescription(
-      `**${analysisResult.players.length}** igrača detektovano • **${analysisResult.total_kills_found}** killova`
-    )
-    .setTimestamp();
+        grouped: Dict[Tuple[int, int, int], List[Tuple[int, str, float]]] = {}
+        n = len(data["text"])
 
-  if (analysisResult.players.length > 0) {
-    const playerList = analysisResult.players
-      .sort((a, b) => b.kills - a.kills)
-      .map(
-        (p) =>
-          `\`${p.name.padEnd(20)}\` **${p.kills}** kills ${p.kills >= 10 ? "🔥" : "⚔️"}`
-      )
-      .join("\n");
+        for i in range(n):
+            text = data["text"][i].strip()
+            if not text:
+                continue
 
-    embed.addFields({
-      name: "📊 Detektovani killovi",
-      value: playerList || "Nema podataka",
-      inline: false,
-    });
-  }
+            try:
+                conf = float(data["conf"][i])
+            except Exception:
+                conf = -1.0
 
-  embed.addFields(
-    {
-      name: "🎯 AI Confidence",
-      value: `\`${analysisResult.confidence.toUpperCase()}\``,
-      inline: true,
-    },
-    {
-      name: "📋 Session ID",
-      value: `\`${sessionId}\``,
-      inline: true,
+            if conf < 5:
+                continue
+
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            left = int(data["left"][i])
+            grouped.setdefault(key, []).append((left, text, conf))
+
+        for _, parts in grouped.items():
+            parts.sort(key=lambda x: x[0])
+            line = normalize_spaces(" ".join(t for _, t, _ in parts))
+            if line:
+                avg_conf = sum(c for _, _, c in parts) / max(1, len(parts))
+                all_lines.append((line, avg_conf))
+
+    deduped = []
+    seen = set()
+    for line, conf in all_lines:
+        key = normalize_name_basic(line)
+        if key not in seen:
+            seen.add(key)
+            deduped.append((line, conf))
+
+    return deduped
+
+def clean_line_for_parse(line: str) -> str:
+    line = normalize_spaces(line)
+    replacements = {
+        "|": " ", "¢": " ", "€": " ", "©": " ", "™": " ",
+        "®": " ", "§": " ", "•": " ", "°": " "
     }
-  );
+    for old, new in replacements.items():
+        line = line.replace(old, new)
 
-  if (analysisResult.notes) {
-    embed.addFields({
-      name: "📝 Napomena",
-      value: analysisResult.notes,
-      inline: false,
-    });
-  }
+    compact_family = FAMILY_NAME.replace(" ", "")
+    line = re.sub(re.escape(compact_family), FAMILY_NAME, line, flags=re.IGNORECASE)
+    return normalize_spaces(line)
 
-  embed.setFooter({
-    text: `Red Lotus Kill Tracker • Koristite /leaderboard za ukupni pregled`,
-  });
+def contains_family_name(line: str) -> bool:
+    return family_name_normalized() in normalize_name_basic(line)
 
-  return embed;
-}
+def extract_known_player_from_line_without_family(line: str) -> Optional[Tuple[str, int, str]]:
+    """
+    V5 PRO FALLBACK:
+    Ako OCR ne uhvati 'Red Lotus', ali prepozna known player + kill,
+    prihvati igraca. Korisno kad je desna kolona slaba ili razdvojena.
+    """
+    if not FORCE_KNOWN_AS_FAMILY:
+        return None
 
-function buildLeaderboardEmbed(data, page = 1) {
-  const PAGE_SIZE = 10;
-  const sorted = Object.entries(data.kills)
-    .sort(([, a], [, b]) => b.kills - a.kills)
-    .filter(([, v]) => v.kills > 0);
+    cleaned = clean_line_for_parse(line)
+    cleaned_no_damage = re.sub(r"\(\s*\d+\s*\)", "", cleaned)
+    cleaned_no_damage = normalize_spaces(cleaned_no_damage)
 
-  const totalPages = Math.ceil(sorted.length / PAGE_SIZE);
-  const start = (page - 1) * PAGE_SIZE;
-  const pageData = sorted.slice(start, start + PAGE_SIZE);
+    numbers = [int(x) for x in re.findall(r"\b\d{1,2}\b", cleaned_no_damage)]
+    possible_kills = [n for n in numbers if 0 <= n <= 50]
+    if not possible_kills:
+        return None
 
-  const embed = new EmbedBuilder()
-    .setColor(0xff2244)
-    .setTitle("🔴 RED LOTUS — Kill Leaderboard")
-    .setDescription(
-      `Ukupno **${formatNumber(data.totalKills)}** killova • **${sorted.length}** aktivnih ratnika`
-    )
-    .setTimestamp();
+    name_part = re.sub(r"\(\s*\d+\s*\)", "", cleaned)
+    name_part = re.sub(r"^\s*\d{1,2}\s+", "", name_part)
+    name_part = re.sub(r"\b\d{1,2}\b", " ", name_part)
+    name_part = normalize_spaces(re.sub(r"[^a-zA-Z0-9 ]", " ", name_part))
+    name_part = clean_player_prefixes(name_part)
 
-  if (pageData.length === 0) {
-    embed.addFields({
-      name: "📊 Leaderboard",
-      value: "Nema podataka još. Pošalji screenshot sa komandom `!addkills`!",
-      inline: false,
-    });
-  } else {
-    const board = pageData
-      .map(([name, stats], i) => {
-        const rank = start + i + 1;
-        const medal = getMedalEmoji(rank);
-        const title = getRankTitle(stats.kills);
-        return `${medal} **#${rank}** \`${name}\`\n    ╰ **${formatNumber(stats.kills)}** kills • ${title}`;
-      })
-      .join("\n\n");
+    if not name_part or is_name_garbage(name_part):
+        return None
 
-    embed.addFields({
-      name: `📊 Top Warriors (Strana ${page}/${totalPages})`,
-      value: board,
-      inline: false,
-    });
-  }
+    canonical_name, source = resolve_player_name(name_part)
 
-  if (data.lastUpdated) {
-    const date = new Date(data.lastUpdated);
-    embed.setFooter({
-      text: `Poslednje ažuriranje: ${date.toLocaleDateString("sr")} ${date.toLocaleTimeString("sr")}`,
-    });
-  }
+    if not canonical_name:
+        loose = resolve_known_player_from_text_loose(name_part)
+        if loose:
+            canonical_name = loose
+            source = "fallback_loose"
+        else:
+            return None
 
-  return { embed, totalPages };
-}
+    if not is_allowed_canonical_name(canonical_name):
+        return None
 
-function buildStatsEmbed(playerName, stats, rank) {
-  const embed = new EmbedBuilder()
-    .setColor(0xff2244)
-    .setTitle(`🔴 RED LOTUS — ${playerName}`)
-    .setDescription(`${getRankTitle(stats.kills)}`)
-    .addFields(
-      { name: "⚔️ Ukupni Killovi", value: `**${formatNumber(stats.kills)}**`, inline: true },
-      { name: "📸 Screenshots", value: `**${stats.screenshots}**`, inline: true },
-      { name: "🏆 Rank", value: `**#${rank}**`, inline: true }
-    )
-    .setTimestamp();
+    kills = min(possible_kills)
 
-  if (stats.firstSeen) {
-    const first = new Date(stats.firstSeen);
-    embed.addFields({
-      name: "📅 Pridružen",
-      value: first.toLocaleDateString("sr"),
-      inline: true,
-    });
-  }
+    return canonical_name, kills, f"fallback_known_no_family:{source}"
 
-  return embed;
-}
+def parse_name_and_kills_from_line(line: str) -> Optional[Tuple[str, int, str]]:
+    original_line = line
+    line = clean_line_for_parse(line)
 
-// ─── COMMAND HANDLERS ────────────────────────────────────────────────────────
+    has_family = contains_family_name(line)
 
-async function handleAddKills(message) {
-  // Provjera da li ima attachmenta
-  if (message.attachments.size === 0) {
-    return message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xff4444)
-          .setTitle("❌ Nedostaje screenshot!")
-          .setDescription(
-            "Pošalji sliku zajedno sa komandom `!addkills`.\n\nPrimer: Priloži screenshot i napiši `!addkills`"
-          ),
-      ],
-    });
-  }
+    if not has_family:
+        fallback = extract_known_player_from_line_without_family(line)
+        if fallback:
+            canonical_name, kills, source = fallback
+            return canonical_name, kills, f"{source} | {original_line}"
+        return None
 
-  const attachment = message.attachments.first();
+    line_no_damage = re.sub(r"\(\s*\d+\s*\)", "", line)
+    line_no_damage = normalize_spaces(line_no_damage)
+    fam_pattern = re.escape(FAMILY_NAME)
 
-  // Provjera fajl tipa
-  if (!attachment.contentType?.startsWith("image/")) {
-    return message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xff4444)
-          .setTitle("❌ Pogrešan format!")
-          .setDescription("Molim pošalji sliku (PNG, JPG, JPEG, WEBP)"),
-      ],
-    });
-  }
+    patterns = [
+        rf"^\s*(\d{{1,2}})\s+(.+?)\s+(\d+)\s+{fam_pattern}\s*$",
+        rf"^\s*(\d{{1,2}})\s+(.+?)\s+(\d+)\s+{fam_pattern}\b",
+    ]
 
-  // Loading poruka
-  const loadingMsg = await message.reply({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(0xffaa00)
-        .setTitle("⏳ AI analizira screenshot...")
-        .setDescription(
-          `Tražim killove familije **${CONFIG.FAMILY_NAME}**...\nOvo može trajati 5-15 sekundi.`
+    for pat in patterns:
+        match = re.search(pat, line_no_damage, flags=re.IGNORECASE)
+        if match:
+            raw_name = clean_player_prefixes(match.group(2).strip())
+            raw_name = normalize_spaces(re.sub(r"[^a-zA-Z0-9 ]", " ", raw_name))
+            kills = int(match.group(3))
+            if raw_name and not is_name_garbage(raw_name) and 0 <= kills <= 50:
+                return raw_name, kills, original_line
+
+    family_index = line_no_damage.lower().find(FAMILY_NAME.lower())
+    if family_index == -1:
+        return None
+
+    left_side = line_no_damage[:family_index].strip()
+    kill_match = re.search(r"(\d+)\s*$", left_side)
+    if not kill_match:
+        return None
+
+    kills = int(kill_match.group(1))
+    raw_name = left_side[:kill_match.start()].strip()
+    raw_name = re.sub(r"^\d{1,2}\s+", "", raw_name).strip()
+    raw_name = clean_player_prefixes(raw_name)
+    raw_name = normalize_spaces(re.sub(r"[^a-zA-Z0-9 ]", " ", raw_name))
+
+    if not raw_name or is_name_garbage(raw_name) or not (0 <= kills <= 50):
+        return None
+
+    return raw_name, kills, original_line
+
+def choose_best_kills(candidates: List[Tuple[int, float]]) -> int:
+    if not candidates:
+        return 0
+
+    score_map: Dict[int, float] = {}
+    count_map: Dict[int, int] = {}
+
+    for kills, conf in candidates:
+        score = max(conf, 1.0)
+
+        # anti-number-error: blaga prednost manjim brojevima
+        if kills <= 3:
+            score += 2.5
+        elif kills <= 7:
+            score += 1.2
+
+        score_map[kills] = score_map.get(kills, 0.0) + score
+        count_map[kills] = count_map.get(kills, 0) + 1
+
+    ranked = sorted(score_map.items(), key=lambda x: (-x[1], -count_map.get(x[0], 0), x[0]))
+    best_kills = ranked[0][0]
+
+    # posebno protiv 1 -> 15 / 1 -> 13 / 1 -> 17
+    if best_kills >= 10:
+        for small in [1, 2, 3]:
+            if small in score_map and score_map[small] >= score_map[best_kills] * 0.82:
+                return small
+
+    return best_kills
+
+def extract_scores_from_image(image_bytes: bytes):
+    regions = preprocess_image_regions(image_bytes)
+
+    board_configs = [
+        "--oem 1 --psm 6",
+        "--oem 1 --psm 4",
+    ]
+
+    parse_logs: List[str] = []
+    all_lines: List[str] = []
+
+    per_player_candidates: Dict[str, List[Tuple[int, float]]] = {}
+
+    for idx, variant in enumerate(regions["board"], start=1):
+        lines_with_conf = ocr_lines_tesseract(variant, board_configs)
+
+        for line, line_conf in lines_with_conf:
+            all_lines.append(line)
+            parsed = parse_name_and_kills_from_line(line)
+            if not parsed:
+                continue
+
+            raw_name, kills, _ = parsed
+            canonical_name, source = resolve_player_name(raw_name)
+
+            if not canonical_name or is_name_garbage(canonical_name) or not is_allowed_canonical_name(canonical_name):
+                parse_logs.append(
+                    f"REJECTED | raw={raw_name} | kills={kills} | source={source} | line={line}"
+                )
+                continue
+
+            per_player_candidates.setdefault(canonical_name, []).append((kills, line_conf))
+            parse_logs.append(
+                f"OK | board_variant={idx} | {raw_name} -> {canonical_name} | kills={kills} | conf={line_conf:.1f} | source={source}"
+            )
+
+    found: Dict[str, int] = {}
+    for canonical_name, candidates in per_player_candidates.items():
+        best_kills = choose_best_kills(candidates)
+        if best_kills > 0:
+            found[canonical_name] = best_kills
+
+    deduped_lines = []
+    seen = set()
+    for line in all_lines:
+        key = normalize_name_basic(line)
+        if key not in seen:
+            seen.add(key)
+            deduped_lines.append(line)
+
+    return found, deduped_lines, parse_logs
+
+# =========================================================
+# TASKS
+# =========================================================
+
+@tasks.loop(minutes=5)
+async def monthly_reset_task():
+    try:
+        did_reset = check_and_reset_monthly_if_needed()
+        if did_reset:
+            await send_log_embed(
+                "📆 AUTO RESET MJESEČNE LISTE",
+                "Mjesečna lista je automatski resetovana prvog u mjesecu u 04:00.",
+                COLOR_WARNING
+            )
+    except Exception as e:
+        await send_log_embed("❌ GREŠKA AUTO RESETA", f"```diff\n- {e}\n```", COLOR_DANGER)
+
+# =========================================================
+# EVENTS
+# =========================================================
+
+@bot.event
+async def on_ready():
+    print(f"Bot online kao {bot.user} | ID: {bot.user.id}")
+    print(f"DATA_DIR: {DATA_DIR}")
+    print(f"FAMILY_NAME: {FAMILY_NAME}")
+    print(f"GUILD_ID: {GUILD_ID}")
+    print("WATCH_CHANNEL_ID:", WATCH_CHANNEL_ID)
+    print("LOG_CHANNEL_ID:", LOG_CHANNEL_ID)
+    print("ADMIN_ROLE_ID:", ADMIN_ROLE_ID)
+
+    for guild in bot.guilds:
+        print(f"CONNECTED GUILD: {guild.name} | ID: {guild.id}")
+
+    if missing_vars:
+        print("Nedostaju ENV varijable:", ", ".join(missing_vars))
+
+    load_known_players()
+
+    did_reset = check_and_reset_monthly_if_needed()
+    if did_reset:
+        await send_log_embed(
+            "📆 AUTO RESET MJESEČNE LISTE",
+            "Mjesečna lista je resetovana pri pokretanju bota.",
+            COLOR_WARNING
+        )
+
+    if not monthly_reset_task.is_running():
+        monthly_reset_task.start()
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    await bot.process_commands(message)
+
+    if message.guild is None or message.guild.id != GUILD_ID:
+        return
+
+    if message.channel.id != WATCH_CHANNEL_ID:
+        return
+
+    if not message.attachments:
+        return
+
+    merged_found: Dict[str, int] = {}
+    all_parse_logs: List[str] = []
+    all_lines_seen: List[str] = []
+
+    for attachment in message.attachments:
+        try:
+            filename_lower = (attachment.filename or "").lower()
+            content_type = attachment.content_type or ""
+
+            is_image = (
+                content_type.startswith("image/")
+                or filename_lower.endswith(".png")
+                or filename_lower.endswith(".jpg")
+                or filename_lower.endswith(".jpeg")
+                or filename_lower.endswith(".webp")
+            )
+
+            if not is_image:
+                continue
+
+            image_bytes = await read_attachment_bytes(attachment)
+            found, lines, parse_logs = extract_scores_from_image(image_bytes)
+
+            all_lines_seen.extend(lines)
+            all_parse_logs.extend(parse_logs)
+
+            for name, kills in found.items():
+                if name in merged_found:
+                    merged_found[name] = max(merged_found[name], kills)
+                else:
+                    merged_found[name] = kills
+
+        except Exception as e:
+            await send_log_embed(
+                "❌ GREŠKA PRI OBRADI SLIKE",
+                f"```diff\n- {attachment.filename}: {e}\n```",
+                COLOR_DANGER
+            )
+
+    if not merged_found:
+        raw_preview = "\n".join(all_lines_seen[:30]) if all_lines_seen else "Nema pročitanih linija."
+        await send_log_embed(
+            f"⚠ OCR NIJE NAŠAO {FAMILY_NAME} IGRAČE",
+            "```yaml\n" + raw_preview[:3500] + "\n```",
+            COLOR_WARNING
+        )
+
+        await message.channel.send(embed=make_embed(
+            f"⚠ Nije pronađen nijedan {FAMILY_NAME} igrač",
+            "Nije prepoznat known Red Lotus igrač. Dodaj igrača sa `!addknown Ime Prezime` ili alias iz OCR loga.",
+            COLOR_WARNING
+        ))
+        return
+
+    weekly_total = add_scores_to_file(WEEKLY_DATA_FILE, merged_found)
+    add_scores_to_file(MONTHLY_DATA_FILE, merged_found)
+
+    await message.channel.send(embed=build_weekly_score_embed_with_bonus(weekly_total))
+
+    log_preview = "\n".join(all_parse_logs[:35]) if all_parse_logs else "Nema parse logova."
+    await send_log_embed("📄 OCR LOG", "```yaml\n" + log_preview[:3500] + "\n```", COLOR_INFO)
+
+# =========================================================
+# COMMANDS
+# =========================================================
+
+@bot.command(name="lista")
+async def lista(ctx: commands.Context):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    await ctx.send(embed=build_weekly_score_embed_with_bonus(load_data(WEEKLY_DATA_FILE)))
+
+@bot.command(name="mjesecnalista")
+async def mjesecnalista(ctx: commands.Context):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    await ctx.send(embed=build_monthly_score_embed(load_data(MONTHLY_DATA_FILE)))
+
+@bot.command(name="resetlista")
+async def resetlista(ctx: commands.Context):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za `!resetlista`.", COLOR_DANGER))
+        return
+    reset_data(WEEKLY_DATA_FILE)
+    await ctx.send(embed=make_embed("🧹 Sedmična lista resetovana", "Sedmična kill lista je uspješno obrisana.", COLOR_WARNING))
+
+@bot.command(name="resetmjesecnalista")
+async def resetmjesecnalista(ctx: commands.Context):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za `!resetmjesecnalista`.", COLOR_DANGER))
+        return
+    reset_data(MONTHLY_DATA_FILE)
+    await ctx.send(embed=make_embed("🧹 Mjesečna lista resetovana", "Mjesečna kill lista je uspješno obrisana.", COLOR_WARNING))
+
+@bot.command(name="remove")
+async def remove_player(ctx: commands.Context, *, player_name: str):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za ovu komandu.", COLOR_DANGER))
+        return
+
+    data = load_data(WEEKLY_DATA_FILE)
+    found_key = find_best_player_key(data, player_name)
+
+    if not found_key:
+        await ctx.send(embed=make_embed("⚠ Igrač nije pronađen", f"Nije pronađen igrač: **{player_name}**", COLOR_WARNING))
+        return
+
+    removed_kills = data[found_key]
+    del data[found_key]
+    save_data(WEEKLY_DATA_FILE, data)
+
+    await ctx.send(embed=make_embed(
+        "🧹 Igrač obrisan",
+        f"Igrač **{format_player_name(found_key)}** je uklonjen sa sedmične liste.\n💀 Obrisano killova: `{removed_kills}`",
+        COLOR_SUCCESS
+    ))
+
+@bot.command(name="removemjesec")
+async def remove_monthly_player(ctx: commands.Context, *, player_name: str):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za ovu komandu.", COLOR_DANGER))
+        return
+
+    data = load_data(MONTHLY_DATA_FILE)
+    found_key = find_best_player_key(data, player_name)
+
+    if not found_key:
+        await ctx.send(embed=make_embed("⚠ Igrač nije pronađen", f"Nije pronađen igrač: **{player_name}**", COLOR_WARNING))
+        return
+
+    removed_kills = data[found_key]
+    del data[found_key]
+    save_data(MONTHLY_DATA_FILE, data)
+
+    await ctx.send(embed=make_embed(
+        "🧹 Igrač obrisan",
+        f"Igrač **{format_player_name(found_key)}** je uklonjen sa mjesečne liste.\n💀 Obrisano killova: `{removed_kills}`",
+        COLOR_SUCCESS
+    ))
+
+@bot.command(name="add")
+async def add_player_kills(ctx: commands.Context, *, args: str):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za ovu komandu.", COLOR_DANGER))
+        return
+
+    match = re.match(r"(.+?)\s*\|\s*(\d+)$", args.strip())
+    if not match:
+        await ctx.send(embed=make_embed("⚠ Pogrešan format", "Koristi:\n```bash\n!add Ime Prezime | 5\n```", COLOR_WARNING))
+        return
+
+    raw_name = match.group(1)
+    kills = int(match.group(2))
+    canonical_name, source = resolve_player_name(raw_name)
+
+    if not canonical_name:
+        await ctx.send(embed=make_embed("⚠ Ime nije poznato", "Prvo dodaj igrača sa `!addknown Ime Prezime`.", COLOR_WARNING))
+        return
+
+    weekly_data = load_data(WEEKLY_DATA_FILE)
+    monthly_data = load_data(MONTHLY_DATA_FILE)
+
+    weekly_data[canonical_name] = weekly_data.get(canonical_name, 0) + kills
+    monthly_data[canonical_name] = monthly_data.get(canonical_name, 0) + kills
+
+    save_data(WEEKLY_DATA_FILE, weekly_data)
+    save_data(MONTHLY_DATA_FILE, monthly_data)
+
+    bonus = kills * KILL_VALUE
+
+    embed = make_embed(
+        "➕ Killovi dodani",
+        (
+            f"**{format_player_name(canonical_name)}**\n"
+            f"💀 Dodano killova: `{kills}`\n"
+            f"💸 Bonus: `{bonus:,}$`\n"
+            f"🧠 Source: `{source}`"
         ),
-    ],
-  });
-
-  try {
-    // AI analiza
-    const analysisResult = await analyzeKillScreenshot(attachment.url);
-
-    // Ažuriramo podatke
-    const data = loadData();
-    const sessionId = `SES${Date.now().toString(36).toUpperCase()}`;
-
-    if (analysisResult.players.length > 0) {
-      data.kills = mergeKillData(data.kills, analysisResult.players);
-      data.totalKills =
-        (data.totalKills || 0) + analysisResult.total_kills_found;
-
-      // Čuvamo session info
-      const sessions = loadSessions();
-      sessions[sessionId] = {
-        timestamp: new Date().toISOString(),
-        addedBy: message.author.id,
-        players: analysisResult.players,
-        totalKills: analysisResult.total_kills_found,
-        imageUrl: attachment.url,
-      };
-      saveSessions(sessions);
-    }
-
-    saveData(data);
-
-    // Edit loading poruke sa rezultatom
-    await loadingMsg.edit({
-      embeds: [
-        buildSuccessEmbed(analysisResult, analysisResult.total_kills_found, sessionId),
-      ],
-    });
-  } catch (err) {
-    console.error("Error analyzing image:", err);
-    await loadingMsg.edit({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xff0000)
-          .setTitle("❌ Greška pri analizi!")
-          .setDescription(
-            `Nisam mogao analizirati sliku.\n\`\`\`${err.message}\`\`\``
-          )
-          .setFooter({ text: "Pokušaj ponovo sa jasnijim screenshotom" }),
-      ],
-    });
-  }
-}
-
-async function handleLeaderboard(message) {
-  const data = loadData();
-
-  if (!data.kills || Object.keys(data.kills).length === 0) {
-    return message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xff4444)
-          .setTitle("📊 Red Lotus Leaderboard")
-          .setDescription(
-            "Nema podataka! Koristite `!addkills` sa screenshotom da dodate killove."
-          ),
-      ],
-    });
-  }
-
-  const { embed, totalPages } = buildLeaderboardEmbed(data, 1);
-
-  const row = new ActionRowBuilder();
-  if (totalPages > 1) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId("lb_prev")
-        .setLabel("◀ Nazad")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(true),
-      new ButtonBuilder()
-        .setCustomId("lb_next_1")
-        .setLabel("Napred ▶")
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(totalPages <= 1)
-    );
-    return message.reply({ embeds: [embed], components: [row] });
-  }
-
-  return message.reply({ embeds: [embed] });
-}
-
-async function handleStats(message, args) {
-  const playerName = args.join(" ");
-  if (!playerName) {
-    return message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xff4444)
-          .setDescription("❌ Unesite ime igrača: `!stats ImePIgraca`"),
-      ],
-    });
-  }
-
-  const data = loadData();
-  const sorted = Object.entries(data.kills).sort(([, a], [, b]) => b.kills - a.kills);
-
-  // Case-insensitive pretraga
-  const match = sorted.find(
-    ([name]) => name.toLowerCase() === playerName.toLowerCase()
-  );
-
-  if (!match) {
-    // Pokušaj fuzzy search
-    const fuzzy = sorted.filter(([name]) =>
-      name.toLowerCase().includes(playerName.toLowerCase())
-    );
-
-    if (fuzzy.length === 0) {
-      return message.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xff4444)
-            .setTitle("❌ Igrač nije pronađen")
-            .setDescription(
-              `**${playerName}** ne postoji u bazi.\nKoristite \`!leaderboard\` da vidite sve igrače.`
-            ),
-        ],
-      });
-    }
-
-    // Prikaži slične
-    const suggestions = fuzzy
-      .slice(0, 5)
-      .map(([name, s]) => `• \`${name}\` — ${s.kills} kills`)
-      .join("\n");
-
-    return message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xffaa00)
-          .setTitle("🔍 Slični igrači pronađeni")
-          .setDescription(suggestions),
-      ],
-    });
-  }
-
-  const [name, stats] = match;
-  const rank = sorted.findIndex(([n]) => n === name) + 1;
-
-  return message.reply({ embeds: [buildStatsEmbed(name, stats, rank)] });
-}
-
-async function handleReset(message) {
-  // Admin check
-  if (
-    CONFIG.ADMIN_ROLE_ID &&
-    !message.member.roles.cache.has(CONFIG.ADMIN_ROLE_ID) &&
-    !message.member.permissions.has(PermissionFlagsBits.Administrator)
-  ) {
-    return message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xff0000)
-          .setDescription("❌ Nemate permisiju za ovu komandu!"),
-      ],
-    });
-  }
-
-  const confirmRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("confirm_reset")
-      .setLabel("✅ DA, resetuj sve")
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId("cancel_reset")
-      .setLabel("❌ Otkaži")
-      .setStyle(ButtonStyle.Secondary)
-  );
-
-  return message.reply({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(0xff0000)
-        .setTitle("⚠️ POTVRDA RESETA")
-        .setDescription(
-          "Da li ste sigurni da želite obrisati SVE kill podatke?\n**Ova akcija je NEPOVRATNA!**"
-        ),
-    ],
-    components: [confirmRow],
-  });
-}
-
-async function handleRemovePlayer(message, args) {
-  if (
-    CONFIG.ADMIN_ROLE_ID &&
-    !message.member.roles.cache.has(CONFIG.ADMIN_ROLE_ID) &&
-    !message.member.permissions.has(PermissionFlagsBits.Administrator)
-  ) {
-    return message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xff0000)
-          .setDescription("❌ Nemate permisiju za ovu komandu!"),
-      ],
-    });
-  }
-
-  const playerName = args.join(" ");
-  if (!playerName) {
-    return message.reply("❌ Unesite ime: `!removeplayer ImePigraca`");
-  }
-
-  const data = loadData();
-  const found = Object.keys(data.kills).find(
-    (n) => n.toLowerCase() === playerName.toLowerCase()
-  );
-
-  if (!found) {
-    return message.reply(`❌ Igrač **${playerName}** nije pronađen.`);
-  }
-
-  const kills = data.kills[found].kills;
-  delete data.kills[found];
-  data.totalKills = Math.max(0, (data.totalKills || 0) - kills);
-  saveData(data);
-
-  return message.reply({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(0x00ff88)
-        .setDescription(
-          `✅ Igrač **${found}** uklonjen iz baze (${kills} killova oduzeto)`
-        ),
-    ],
-  });
-}
-
-async function handleHelp(message) {
-  const embed = new EmbedBuilder()
-    .setColor(0xff2244)
-    .setTitle("🔴 RED LOTUS KILL TRACKER — Komande")
-    .setDescription("Bot za praćenje killova familije Red Lotus")
-    .addFields(
-      {
-        name: "📸 `!addkills`",
-        value: "Priloži screenshot uz komandu. Bot će AI analizom izvući killove Red Lotus igrača i dodati ih u bazu.",
-        inline: false,
-      },
-      {
-        name: "🏆 `!leaderboard`",
-        value: "Prikaži rang listu svih igrača po broju killova.",
-        inline: false,
-      },
-      {
-        name: "📊 `!stats [ime]`",
-        value: "Prikaži statistiku za određenog igrača.\nPrimer: `!stats RedLotus_Player`",
-        inline: false,
-      },
-      {
-        name: "🗑️ `!removeplayer [ime]`",
-        value: "(Admin) Ukloni igrača iz baze.",
-        inline: false,
-      },
-      {
-        name: "🔄 `!reset`",
-        value: "(Admin) Resetuj sve podatke.",
-        inline: false,
-      }
+        COLOR_SUCCESS
     )
-    .setFooter({ text: `Red Lotus Kill Tracker • Familija: ${CONFIG.FAMILY_NAME}` });
+    embed.add_field(name="Sedmično", value=str(weekly_data[canonical_name]), inline=True)
+    embed.add_field(name="Mjesečno", value=str(monthly_data[canonical_name]), inline=True)
+    await ctx.send(embed=embed)
 
-  return message.reply({ embeds: [embed] });
-}
+@bot.command(name="addmjesec")
+async def add_monthly_kills(ctx: commands.Context, *, args: str):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za ovu komandu.", COLOR_DANGER))
+        return
 
-// ─── EVENT HANDLERS ───────────────────────────────────────────────────────────
+    match = re.match(r"(.+?)\s*\|\s*(\d+)$", args.strip())
+    if not match:
+        await ctx.send(embed=make_embed("⚠ Pogrešan format", "Koristi:\n```bash\n!addmjesec Ime Prezime | 5\n```", COLOR_WARNING))
+        return
 
-client.once("ready", () => {
-  console.log(`
-╔══════════════════════════════════════════════╗
-║   🔴 RED LOTUS KILL TRACKER — ONLINE!        ║
-║   Bot: ${client.user.tag.padEnd(34)}║
-║   Familija: ${CONFIG.FAMILY_NAME.padEnd(31)}║
-╚══════════════════════════════════════════════╝
-  `);
+    raw_name = match.group(1)
+    kills = int(match.group(2))
+    canonical_name, source = resolve_player_name(raw_name)
 
-  client.user.setPresence({
-    activities: [{ name: "🔴 Red Lotus Killove | !help", type: 3 }],
-    status: "online",
-  });
-});
+    if not canonical_name:
+        await ctx.send(embed=make_embed("⚠ Ime nije poznato", "Prvo dodaj igrača sa `!addknown Ime Prezime`.", COLOR_WARNING))
+        return
 
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (!message.content.startsWith("!")) return;
+    monthly_data = load_data(MONTHLY_DATA_FILE)
+    monthly_data[canonical_name] = monthly_data.get(canonical_name, 0) + kills
+    save_data(MONTHLY_DATA_FILE, monthly_data)
 
-  const args = message.content.slice(1).trim().split(/ +/);
-  const command = args.shift().toLowerCase();
+    await ctx.send(embed=make_embed(
+        "➕ Dodani mjesečni killovi",
+        (
+            f"**{format_player_name(canonical_name)}**\n"
+            f"💀 Dodano: `{kills}` killova\n"
+            f"📆 Ukupno mjesečno: `{monthly_data[canonical_name]}`\n"
+            f"🧠 Source: `{source}`"
+        ),
+        COLOR_SUCCESS
+    ))
 
-  try {
-    switch (command) {
-      case "addkills":
-      case "kills":
-      case "upload":
-        await handleAddKills(message);
-        break;
-      case "leaderboard":
-      case "lb":
-      case "top":
-        await handleLeaderboard(message);
-        break;
-      case "stats":
-      case "player":
-        await handleStats(message, args);
-        break;
-      case "reset":
-        await handleReset(message);
-        break;
-      case "removeplayer":
-      case "remove":
-        await handleRemovePlayer(message, args);
-        break;
-      case "help":
-      case "komande":
-        await handleHelp(message);
-        break;
-    }
-  } catch (err) {
-    console.error(`Greška pri komandi ${command}:`, err);
-    message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0xff0000)
-          .setDescription(`❌ Interna greška: \`${err.message}\``),
-      ],
-    });
-  }
-});
+@bot.command(name="set")
+async def set_weekly_kills(ctx: commands.Context, *, args: str):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za ovu komandu.", COLOR_DANGER))
+        return
 
-// Button interactions (leaderboard paginacija i reset potvrda)
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isButton()) return;
+    match = re.match(r"(.+?)\s*\|\s*(\d+)$", args.strip())
+    if not match:
+        await ctx.send(embed=make_embed("⚠ Pogrešan format", "Koristi:\n```bash\n!set Ime Prezime | 20\n```", COLOR_WARNING))
+        return
 
-  const { customId } = interaction;
+    raw_name = match.group(1)
+    kills = int(match.group(2))
+    canonical_name, source = resolve_player_name(raw_name)
 
-  // Reset potvrda
-  if (customId === "confirm_reset") {
-    saveData({ kills: {}, totalKills: 0, lastUpdated: null });
-    saveSessions({});
-    return interaction.update({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x00ff88)
-          .setTitle("✅ Reset Uspješan")
-          .setDescription("Svi kill podaci su obrisani."),
-      ],
-      components: [],
-    });
-  }
+    if not canonical_name:
+        await ctx.send(embed=make_embed("⚠ Ime nije poznato", "Prvo dodaj igrača sa `!addknown Ime Prezime`.", COLOR_WARNING))
+        return
 
-  if (customId === "cancel_reset") {
-    return interaction.update({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x00ff88)
-          .setDescription("✅ Reset otkazan."),
-      ],
-      components: [],
-    });
-  }
+    weekly_data = load_data(WEEKLY_DATA_FILE)
+    weekly_data[canonical_name] = kills
+    save_data(WEEKLY_DATA_FILE, weekly_data)
 
-  // Leaderboard paginacija
-  if (customId.startsWith("lb_")) {
-    const data = loadData();
-    const { embed, totalPages } = buildLeaderboardEmbed(data);
-    return interaction.update({ embeds: [embed] });
-  }
-});
+    bonus = kills * KILL_VALUE
+    await ctx.send(embed=make_embed(
+        "✏ Sedmična lista ažurirana",
+        (
+            f"**{format_player_name(canonical_name)}**\n"
+            f"💀 Novi sedmični killovi: `{kills}`\n"
+            f"💸 Bonus: `{bonus:,}$`\n"
+            f"🧠 Source: `{source}`"
+        ),
+        COLOR_INFO
+    ))
 
-// ─── POKRETANJE ───────────────────────────────────────────────────────────────
+@bot.command(name="setmjesec")
+async def set_monthly_kills(ctx: commands.Context, *, args: str):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za ovu komandu.", COLOR_DANGER))
+        return
 
-if (!process.env.DISCORD_TOKEN) {
-  console.error("❌ GREŠKA: DISCORD_TOKEN nije postavljen u .env fajlu!");
-  process.exit(1);
-}
+    match = re.match(r"(.+?)\s*\|\s*(\d+)$", args.strip())
+    if not match:
+        await ctx.send(embed=make_embed("⚠ Pogrešan format", "Koristi:\n```bash\n!setmjesec Ime Prezime | 20\n```", COLOR_WARNING))
+        return
 
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.error("❌ GREŠKA: ANTHROPIC_API_KEY nije postavljen u .env fajlu!");
-  process.exit(1);
-}
+    raw_name = match.group(1)
+    kills = int(match.group(2))
+    canonical_name, source = resolve_player_name(raw_name)
 
-client.login(process.env.DISCORD_TOKEN);
+    if not canonical_name:
+        await ctx.send(embed=make_embed("⚠ Ime nije poznato", "Prvo dodaj igrača sa `!addknown Ime Prezime`.", COLOR_WARNING))
+        return
+
+    monthly_data = load_data(MONTHLY_DATA_FILE)
+    monthly_data[canonical_name] = kills
+    save_data(MONTHLY_DATA_FILE, monthly_data)
+
+    await ctx.send(embed=make_embed(
+        "✏ Mjesečna lista ažurirana",
+        (
+            f"**{format_player_name(canonical_name)}**\n"
+            f"💀 Novi mjesečni killovi: `{kills}`\n"
+            f"🧠 Source: `{source}`"
+        ),
+        COLOR_INFO
+    ))
+
+@bot.command(name="learned")
+async def learned(ctx: commands.Context):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+
+    data = load_learned_names()
+    if not data:
+        await ctx.send(embed=make_embed("🧠 Naučena imena", "Bot još nije naučio nijedno ime.", COLOR_WARNING))
+        return
+
+    lines = [f"{k} -> {v}" for k, v in list(data.items())[:40]]
+    await ctx.send(embed=make_embed("🧠 Naučena imena", "```yaml\n" + "\n".join(lines) + "\n```", COLOR_INFO))
+
+@bot.command(name="known")
+async def known_players_command(ctx: commands.Context):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+
+    players = load_known_players()
+    if not players:
+        await ctx.send(embed=make_embed("📋 Known Players", "Lista je prazna.", COLOR_WARNING))
+        return
+
+    lines = players[:60]
+    await ctx.send(embed=make_embed("📋 Known Players", "```yaml\n" + "\n".join(lines) + "\n```", COLOR_INFO))
+
+@bot.command(name="addknown")
+async def add_known_player(ctx: commands.Context, *, player_name: str):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za ovu komandu.", COLOR_DANGER))
+        return
+
+    players = load_known_players()
+    players.append(player_name)
+    save_known_players(players)
+
+    await ctx.send(embed=make_embed("✅ Dodan known player", f"Dodano ime: **{player_name}**", COLOR_SUCCESS))
+
+@bot.command(name="alias")
+async def add_alias(ctx: commands.Context, *, args: str):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+    if not ensure_admin(ctx):
+        await ctx.send(embed=make_embed("❌ Pristup odbijen", "Nemaš dozvolu za ovu komandu.", COLOR_DANGER))
+        return
+
+    match = re.match(r"(.+?)\s*\|\s*(.+)$", args.strip())
+    if not match:
+        await ctx.send(embed=make_embed(
+            "⚠ Pogrešan format",
+            "Koristi:\n```bash\n!alias pogresno ime | tacno ime\n```",
+            COLOR_WARNING
+        ))
+        return
+
+    wrong = normalize_name_basic(match.group(1))
+    correct = normalize_name_basic(match.group(2))
+
+    if not wrong or not correct:
+        await ctx.send(embed=make_embed("⚠ Greška", "Alias nije validan.", COLOR_WARNING))
+        return
+
+    ALIASES[wrong] = correct
+    learn_name(wrong, correct)
+
+    await ctx.send(embed=make_embed("✅ Alias dodat", f"`{wrong}` → `{correct}`", COLOR_SUCCESS))
+
+@bot.command(name="komande")
+async def komande(ctx: commands.Context):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+
+    image_path = os.path.join(".", "komande.png")
+    if not os.path.exists(image_path):
+        await ctx.send("⚠ Slika `komande.png` nije pronađena u projektu.")
+        return
+
+    await ctx.send(file=discord.File(image_path))
+
+@bot.command(name="help")
+async def help_command(ctx: commands.Context):
+    if ctx.guild is None or ctx.guild.id != GUILD_ID:
+        return
+
+    embed = make_embed(f"📘 {BOT_NAME} Komande", f"Glavne komande za {FAMILY_NAME} listu.", COLOR_INFO)
+
+    embed.add_field(
+        name="🏆 Sedmična lista",
+        value=(
+            "`!lista`\n"
+            "`!resetlista`\n"
+            "`!remove Ime`\n"
+            "`!set Ime | broj`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📆 Mjesečna lista",
+        value=(
+            "`!mjesecnalista`\n"
+            "`!resetmjesecnalista`\n"
+            "`!removemjesec Ime`\n"
+            "`!setmjesec Ime | broj`\n"
+            "`!addmjesec Ime | broj`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="➕ Ručno dodavanje",
+        value="`!add Ime | broj`",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🧠 OCR / Known players",
+        value="`!learned`\n`!known`\n`!addknown Ime`\n`!alias pogresno | tacno`\n`!komande`",
+        inline=False
+    )
+
+    await ctx.send(embed=embed)
+
+@bot.event
+async def on_command_error(ctx, error):
+    print("COMMAND ERROR:", repr(error))
+
+if __name__ == "__main__":
+    if missing_vars:
+        print("UPOZORENJE: Nedostaju ENV varijable:", ", ".join(missing_vars))
+    bot.run(DISCORD_TOKEN)
