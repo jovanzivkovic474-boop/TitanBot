@@ -27,7 +27,7 @@ ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
 FAMILY_NAME = os.getenv("FAMILY_NAME", "Red Lotus").strip()
 KILL_VALUE = int(os.getenv("KILL_VALUE", "15000"))
 
-BOT_NAME = os.getenv("BOT_NAME", "Bonus Bot by DD").strip()
+BOT_NAME = os.getenv("BOT_NAME", "STATS").strip()
 THUMBNAIL_URL = os.getenv("THUMBNAIL_URL", "").strip()
 BANNER_URL = os.getenv("BANNER_URL", "").strip()
 
